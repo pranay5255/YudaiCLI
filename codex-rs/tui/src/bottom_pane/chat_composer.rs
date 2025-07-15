@@ -28,6 +28,9 @@ const MIN_TEXTAREA_ROWS: usize = 1;
 const BORDER_LINES: u16 = 2;
 
 const BASE_PLACEHOLDER_TEXT: &str = "send a message";
+/// If the pasted content exceeds this number of characters, replace it with a
+/// placeholder in the UI.
+const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 
 /// Result returned when the user interacts with the text area.
 pub enum InputResult {
@@ -43,6 +46,7 @@ pub(crate) struct ChatComposer<'a> {
     ctrl_c_quit_hint: bool,
     dismissed_file_popup_token: Option<String>,
     current_file_query: Option<String>,
+    pending_pastes: Vec<(String, String)>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -66,6 +70,7 @@ impl ChatComposer<'_> {
             ctrl_c_quit_hint: false,
             dismissed_file_popup_token: None,
             current_file_query: None,
+            pending_pastes: Vec::new(),
         };
         this.update_border(has_input_focus);
         this
@@ -90,13 +95,10 @@ impl ChatComposer<'_> {
                     // percentage.
                     100
                 };
-                if percent_remaining > 25 {
-                    format!("{BASE_PLACEHOLDER_TEXT} — {percent_remaining}% context left")
-                } else {
-                    format!(
-                        "{BASE_PLACEHOLDER_TEXT} — {percent_remaining}% context left (consider /compact)"
-                    )
-                }
+                // When https://github.com/openai/codex/issues/1257 is resolved,
+                // check if `percent_remaining < 25`, and if so, recommend
+                // /compact.
+                format!("{BASE_PLACEHOLDER_TEXT} — {percent_remaining}% context left")
             }
             (total_tokens, None) => {
                 format!("{BASE_PLACEHOLDER_TEXT} — {total_tokens} tokens used")
@@ -127,6 +129,20 @@ impl ChatComposer<'_> {
 
     pub fn set_input_focus(&mut self, has_focus: bool) {
         self.update_border(has_focus);
+    }
+
+    pub fn handle_paste(&mut self, pasted: String) -> bool {
+        let char_count = pasted.chars().count();
+        if char_count > LARGE_PASTE_CHAR_THRESHOLD {
+            let placeholder = format!("[Pasted Content {char_count} chars]");
+            self.textarea.insert_str(&placeholder);
+            self.pending_pastes.push((placeholder, pasted));
+        } else {
+            self.textarea.insert_str(&pasted);
+        }
+        self.sync_command_popup();
+        self.sync_file_search_popup();
+        true
     }
 
     /// Integrate results from an asynchronous file search.
@@ -290,26 +306,28 @@ impl ChatComposer<'_> {
         // Guard against out-of-bounds rows.
         let line = textarea.lines().get(row)?.as_str();
 
-        // Clamp the cursor column to the line length to avoid slicing panics
-        // when the cursor is at the end of the line.
-        let col = col.min(line.len());
+        // Calculate byte offset for cursor position
+        let cursor_byte_offset = line.chars().take(col).map(|c| c.len_utf8()).sum::<usize>();
 
         // Split the line at the cursor position so we can search for word
         // boundaries on both sides.
-        let before_cursor = &line[..col];
-        let after_cursor = &line[col..];
+        let before_cursor = &line[..cursor_byte_offset];
+        let after_cursor = &line[cursor_byte_offset..];
 
-        // Find start index (first character **after** the previous whitespace).
+        // Find start index (first character **after** the previous multi-byte whitespace).
         let start_idx = before_cursor
-            .rfind(|c: char| c.is_whitespace())
-            .map(|idx| idx + 1)
+            .char_indices()
+            .rfind(|(_, c)| c.is_whitespace())
+            .map(|(idx, c)| idx + c.len_utf8())
             .unwrap_or(0);
 
-        // Find end index (first whitespace **after** the cursor position).
+        // Find end index (first multi-byte whitespace **after** the cursor position).
         let end_rel_idx = after_cursor
-            .find(|c: char| c.is_whitespace())
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
+            .map(|(idx, _)| idx)
             .unwrap_or(after_cursor.len());
-        let end_idx = col + end_rel_idx;
+        let end_idx = cursor_byte_offset + end_rel_idx;
 
         if start_idx >= end_idx {
             return None;
@@ -336,21 +354,25 @@ impl ChatComposer<'_> {
         let mut lines: Vec<String> = self.textarea.lines().to_vec();
 
         if let Some(line) = lines.get_mut(row) {
-            let col = col.min(line.len());
+            // Calculate byte offset for cursor position
+            let cursor_byte_offset = line.chars().take(col).map(|c| c.len_utf8()).sum::<usize>();
 
-            let before_cursor = &line[..col];
-            let after_cursor = &line[col..];
+            let before_cursor = &line[..cursor_byte_offset];
+            let after_cursor = &line[cursor_byte_offset..];
 
             // Determine token boundaries.
             let start_idx = before_cursor
-                .rfind(|c: char| c.is_whitespace())
-                .map(|idx| idx + 1)
+                .char_indices()
+                .rfind(|(_, c)| c.is_whitespace())
+                .map(|(idx, c)| idx + c.len_utf8())
                 .unwrap_or(0);
 
             let end_rel_idx = after_cursor
-                .find(|c: char| c.is_whitespace())
+                .char_indices()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(idx, _)| idx)
                 .unwrap_or(after_cursor.len());
-            let end_idx = col + end_rel_idx;
+            let end_idx = cursor_byte_offset + end_rel_idx;
 
             // Replace the slice `[start_idx, end_idx)` with the chosen path and a trailing space.
             let mut new_line =
@@ -411,9 +433,17 @@ impl ChatComposer<'_> {
                 alt: false,
                 ctrl: false,
             } => {
-                let text = self.textarea.lines().join("\n");
+                let mut text = self.textarea.lines().join("\n");
                 self.textarea.select_all();
                 self.textarea.cut();
+
+                // Replace all pending pastes in the text
+                for (placeholder, actual) in &self.pending_pastes {
+                    if text.contains(placeholder) {
+                        text = text.replace(placeholder, actual);
+                    }
+                }
+                self.pending_pastes.clear();
 
                 if text.is_empty() {
                     (InputResult::None, true)
@@ -440,8 +470,69 @@ impl ChatComposer<'_> {
 
     /// Handle generic Input events that modify the textarea content.
     fn handle_input_basic(&mut self, input: Input) -> (InputResult, bool) {
+        // Special handling for backspace on placeholders
+        if let Input {
+            key: Key::Backspace,
+            ..
+        } = input
+        {
+            if self.try_remove_placeholder_at_cursor() {
+                return (InputResult::None, true);
+            }
+        }
+
+        // Normal input handling
         self.textarea.input(input);
+        let text_after = self.textarea.lines().join("\n");
+
+        // Check if any placeholders were removed and remove their corresponding pending pastes
+        self.pending_pastes
+            .retain(|(placeholder, _)| text_after.contains(placeholder));
+
         (InputResult::None, true)
+    }
+
+    /// Attempts to remove a placeholder if the cursor is at the end of one.
+    /// Returns true if a placeholder was removed.
+    fn try_remove_placeholder_at_cursor(&mut self) -> bool {
+        let (row, col) = self.textarea.cursor();
+        let line = self
+            .textarea
+            .lines()
+            .get(row)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        // Find any placeholder that ends at the cursor position
+        let placeholder_to_remove = self.pending_pastes.iter().find_map(|(ph, _)| {
+            if col < ph.len() {
+                return None;
+            }
+            let potential_ph_start = col - ph.len();
+            if line[potential_ph_start..col] == *ph {
+                Some(ph.clone())
+            } else {
+                None
+            }
+        });
+
+        if let Some(placeholder) = placeholder_to_remove {
+            // Remove the entire placeholder from the text
+            let placeholder_len = placeholder.len();
+            for _ in 0..placeholder_len {
+                self.textarea.input(Input {
+                    key: Key::Backspace,
+                    ctrl: false,
+                    alt: false,
+                    shift: false,
+                });
+            }
+            // Remove from pending pastes
+            self.pending_pastes.retain(|(ph, _)| ph != &placeholder);
+            true
+        } else {
+            false
+        }
     }
 
     /// Synchronize `self.command_popup` with the current text in the
@@ -616,5 +707,478 @@ impl WidgetRef for &ChatComposer<'_> {
                 self.textarea.render(area, buf);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bottom_pane::AppEventSender;
+    use crate::bottom_pane::ChatComposer;
+    use crate::bottom_pane::InputResult;
+    use crate::bottom_pane::chat_composer::LARGE_PASTE_CHAR_THRESHOLD;
+    use tui_textarea::TextArea;
+
+    #[test]
+    fn test_current_at_token_basic_cases() {
+        let test_cases = vec![
+            // Valid @ tokens
+            ("@hello", 3, Some("hello".to_string()), "Basic ASCII token"),
+            (
+                "@file.txt",
+                4,
+                Some("file.txt".to_string()),
+                "ASCII with extension",
+            ),
+            (
+                "hello @world test",
+                8,
+                Some("world".to_string()),
+                "ASCII token in middle",
+            ),
+            (
+                "@test123",
+                5,
+                Some("test123".to_string()),
+                "ASCII with numbers",
+            ),
+            // Unicode examples
+            ("@İstanbul", 3, Some("İstanbul".to_string()), "Turkish text"),
+            (
+                "@testЙЦУ.rs",
+                8,
+                Some("testЙЦУ.rs".to_string()),
+                "Mixed ASCII and Cyrillic",
+            ),
+            ("@诶", 2, Some("诶".to_string()), "Chinese character"),
+            ("@👍", 2, Some("👍".to_string()), "Emoji token"),
+            // Invalid cases (should return None)
+            ("hello", 2, None, "No @ symbol"),
+            ("@", 1, None, "Only @ symbol"),
+            ("@ hello", 2, None, "@ followed by space"),
+            ("test @ world", 6, None, "@ with spaces around"),
+        ];
+
+        for (input, cursor_pos, expected, description) in test_cases {
+            let mut textarea = TextArea::default();
+            textarea.insert_str(input);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos));
+
+            let result = ChatComposer::current_at_token(&textarea);
+            assert_eq!(
+                result, expected,
+                "Failed for case: {description} - input: '{input}', cursor: {cursor_pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_current_at_token_cursor_positions() {
+        let test_cases = vec![
+            // Different cursor positions within a token
+            ("@test", 0, Some("test".to_string()), "Cursor at @"),
+            ("@test", 1, Some("test".to_string()), "Cursor after @"),
+            ("@test", 5, Some("test".to_string()), "Cursor at end"),
+            // Multiple tokens - cursor determines which token
+            ("@file1 @file2", 0, Some("file1".to_string()), "First token"),
+            (
+                "@file1 @file2",
+                8,
+                Some("file2".to_string()),
+                "Second token",
+            ),
+            // Edge cases
+            ("@", 0, None, "Only @ symbol"),
+            ("@a", 2, Some("a".to_string()), "Single character after @"),
+            ("", 0, None, "Empty input"),
+        ];
+
+        for (input, cursor_pos, expected, description) in test_cases {
+            let mut textarea = TextArea::default();
+            textarea.insert_str(input);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos));
+
+            let result = ChatComposer::current_at_token(&textarea);
+            assert_eq!(
+                result, expected,
+                "Failed for cursor position case: {description} - input: '{input}', cursor: {cursor_pos}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_current_at_token_whitespace_boundaries() {
+        let test_cases = vec![
+            // Space boundaries
+            (
+                "aaa@aaa",
+                4,
+                None,
+                "Connected @ token - no completion by design",
+            ),
+            (
+                "aaa @aaa",
+                5,
+                Some("aaa".to_string()),
+                "@ token after space",
+            ),
+            (
+                "test @file.txt",
+                7,
+                Some("file.txt".to_string()),
+                "@ token after space",
+            ),
+            // Full-width space boundaries
+            (
+                "test　@İstanbul",
+                6,
+                Some("İstanbul".to_string()),
+                "@ token after full-width space",
+            ),
+            (
+                "@ЙЦУ　@诶",
+                6,
+                Some("诶".to_string()),
+                "Full-width space between Unicode tokens",
+            ),
+            // Tab and newline boundaries
+            (
+                "test\t@file",
+                6,
+                Some("file".to_string()),
+                "@ token after tab",
+            ),
+        ];
+
+        for (input, cursor_pos, expected, description) in test_cases {
+            let mut textarea = TextArea::default();
+            textarea.insert_str(input);
+            textarea.move_cursor(tui_textarea::CursorMove::Jump(0, cursor_pos));
+
+            let result = ChatComposer::current_at_token(&textarea);
+            assert_eq!(
+                result, expected,
+                "Failed for whitespace boundary case: {description} - input: '{input}', cursor: {cursor_pos}",
+            );
+        }
+    }
+
+    #[test]
+    fn handle_paste_small_inserts_text() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        let needs_redraw = composer.handle_paste("hello".to_string());
+        assert!(needs_redraw);
+        assert_eq!(composer.textarea.lines(), ["hello"]);
+        assert!(composer.pending_pastes.is_empty());
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match result {
+            InputResult::Submitted(text) => assert_eq!(text, "hello"),
+            _ => panic!("expected Submitted"),
+        }
+    }
+
+    #[test]
+    fn handle_paste_large_uses_placeholder_and_replaces_on_submit() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        let large = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 10);
+        let needs_redraw = composer.handle_paste(large.clone());
+        assert!(needs_redraw);
+        let placeholder = format!("[Pasted Content {} chars]", large.chars().count());
+        assert_eq!(composer.textarea.lines(), [placeholder.as_str()]);
+        assert_eq!(composer.pending_pastes.len(), 1);
+        assert_eq!(composer.pending_pastes[0].0, placeholder);
+        assert_eq!(composer.pending_pastes[0].1, large);
+
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match result {
+            InputResult::Submitted(text) => assert_eq!(text, large),
+            _ => panic!("expected Submitted"),
+        }
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn edit_clears_pending_paste() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let large = "y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 1);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        composer.handle_paste(large);
+        assert_eq!(composer.pending_pastes.len(), 1);
+
+        // Any edit that removes the placeholder should clear pending_paste
+        composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(composer.pending_pastes.is_empty());
+    }
+
+    #[test]
+    fn ui_snapshots() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use insta::assert_snapshot;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut terminal = match Terminal::new(TestBackend::new(100, 10)) {
+            Ok(t) => t,
+            Err(e) => panic!("Failed to create terminal: {e}"),
+        };
+
+        let test_cases = vec![
+            ("empty", None),
+            ("small", Some("short".to_string())),
+            ("large", Some("z".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5))),
+            ("multiple_pastes", None),
+            ("backspace_after_pastes", None),
+        ];
+
+        for (name, input) in test_cases {
+            // Create a fresh composer for each test case
+            let mut composer = ChatComposer::new(true, sender.clone());
+
+            if let Some(text) = input {
+                composer.handle_paste(text);
+            } else if name == "multiple_pastes" {
+                // First large paste
+                composer.handle_paste("x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3));
+                // Second large paste
+                composer.handle_paste("y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7));
+                // Small paste
+                composer.handle_paste(" another short paste".to_string());
+            } else if name == "backspace_after_pastes" {
+                // Three large pastes
+                composer.handle_paste("a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 2));
+                composer.handle_paste("b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4));
+                composer.handle_paste("c".repeat(LARGE_PASTE_CHAR_THRESHOLD + 6));
+                // Move cursor to end and press backspace
+                composer.textarea.move_cursor(tui_textarea::CursorMove::End);
+                composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            }
+
+            terminal
+                .draw(|f| f.render_widget_ref(&composer, f.area()))
+                .unwrap_or_else(|e| panic!("Failed to draw {name} composer: {e}"));
+
+            assert_snapshot!(name, terminal.backend());
+        }
+    }
+
+    #[test]
+    fn test_multiple_pastes_submission() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        // Define test cases: (paste content, is_large)
+        let test_cases = [
+            ("x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 3), true),
+            (" and ".to_string(), false),
+            ("y".repeat(LARGE_PASTE_CHAR_THRESHOLD + 7), true),
+        ];
+
+        // Expected states after each paste
+        let mut expected_text = String::new();
+        let mut expected_pending_count = 0;
+
+        // Apply all pastes and build expected state
+        let states: Vec<_> = test_cases
+            .iter()
+            .map(|(content, is_large)| {
+                composer.handle_paste(content.clone());
+                if *is_large {
+                    let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
+                    expected_text.push_str(&placeholder);
+                    expected_pending_count += 1;
+                } else {
+                    expected_text.push_str(content);
+                }
+                (expected_text.clone(), expected_pending_count)
+            })
+            .collect();
+
+        // Verify all intermediate states were correct
+        assert_eq!(
+            states,
+            vec![
+                (
+                    format!("[Pasted Content {} chars]", test_cases[0].0.chars().count()),
+                    1
+                ),
+                (
+                    format!(
+                        "[Pasted Content {} chars] and ",
+                        test_cases[0].0.chars().count()
+                    ),
+                    1
+                ),
+                (
+                    format!(
+                        "[Pasted Content {} chars] and [Pasted Content {} chars]",
+                        test_cases[0].0.chars().count(),
+                        test_cases[2].0.chars().count()
+                    ),
+                    2
+                ),
+            ]
+        );
+
+        // Submit and verify final expansion
+        let (result, _) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        if let InputResult::Submitted(text) = result {
+            assert_eq!(text, format!("{} and {}", test_cases[0].0, test_cases[2].0));
+        } else {
+            panic!("expected Submitted");
+        }
+    }
+
+    #[test]
+    fn test_placeholder_deletion() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        // Define test cases: (content, is_large)
+        let test_cases = [
+            ("a".repeat(LARGE_PASTE_CHAR_THRESHOLD + 5), true),
+            (" and ".to_string(), false),
+            ("b".repeat(LARGE_PASTE_CHAR_THRESHOLD + 6), true),
+        ];
+
+        // Apply all pastes
+        let mut current_pos = 0;
+        let states: Vec<_> = test_cases
+            .iter()
+            .map(|(content, is_large)| {
+                composer.handle_paste(content.clone());
+                if *is_large {
+                    let placeholder = format!("[Pasted Content {} chars]", content.chars().count());
+                    current_pos += placeholder.len();
+                } else {
+                    current_pos += content.len();
+                }
+                (
+                    composer.textarea.lines().join("\n"),
+                    composer.pending_pastes.len(),
+                    current_pos,
+                )
+            })
+            .collect();
+
+        // Delete placeholders one by one and collect states
+        let mut deletion_states = vec![];
+
+        // First deletion
+        composer
+            .textarea
+            .move_cursor(tui_textarea::CursorMove::Jump(0, states[0].2 as u16));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        deletion_states.push((
+            composer.textarea.lines().join("\n"),
+            composer.pending_pastes.len(),
+        ));
+
+        // Second deletion
+        composer
+            .textarea
+            .move_cursor(tui_textarea::CursorMove::Jump(
+                0,
+                composer.textarea.lines().join("\n").len() as u16,
+            ));
+        composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        deletion_states.push((
+            composer.textarea.lines().join("\n"),
+            composer.pending_pastes.len(),
+        ));
+
+        // Verify all states
+        assert_eq!(
+            deletion_states,
+            vec![
+                (" and [Pasted Content 1006 chars]".to_string(), 1),
+                (" and ".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_partial_placeholder_deletion() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(true, sender);
+
+        // Define test cases: (cursor_position_from_end, expected_pending_count)
+        let test_cases = [
+            5, // Delete from middle - should clear tracking
+            0, // Delete from end - should clear tracking
+        ];
+
+        let paste = "x".repeat(LARGE_PASTE_CHAR_THRESHOLD + 4);
+        let placeholder = format!("[Pasted Content {} chars]", paste.chars().count());
+
+        let states: Vec<_> = test_cases
+            .into_iter()
+            .map(|pos_from_end| {
+                composer.handle_paste(paste.clone());
+                composer
+                    .textarea
+                    .move_cursor(tui_textarea::CursorMove::Jump(
+                        0,
+                        (placeholder.len() - pos_from_end) as u16,
+                    ));
+                composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+                let result = (
+                    composer.textarea.lines().join("\n").contains(&placeholder),
+                    composer.pending_pastes.len(),
+                );
+                composer.textarea.select_all();
+                composer.textarea.cut();
+                result
+            })
+            .collect();
+
+        assert_eq!(
+            states,
+            vec![
+                (false, 0), // After deleting from middle
+                (false, 0), // After deleting from end
+            ]
+        );
     }
 }
